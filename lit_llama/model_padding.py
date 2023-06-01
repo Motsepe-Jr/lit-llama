@@ -46,34 +46,13 @@ llama_configs = {
 }
 
 
-def validate(inp, in_features):
-    # Mimic TransformerEngine's validation
-    assert inp.shape[-1] == in_features, f"GEMM not possible, {inp.shape[-1]} != {in_features}"
-    inputmat = inp.view((-1, in_features))
-    a, b = inputmat.shape
-    if not (a % 8 or b % 16):
-        raise ValueError(
-            "Tensor dimensions are not compatible for FP8 execution: "
-            f"({a} % 8 != 0, {b} % 16 != 0)"
-        )
-
-
-class TELinear(nn.Linear):
-    # Mimic TransformerEngine's Linear
-    def forward(self, input):
-        in_features = self.weight.shape[-1]
-        validate(input, in_features)
-        validate(self.weight, in_features)
-        return super().forward(input)
-
-
 class PaddedLLaMA(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
 
-        self.lm_head = TELinear(config.n_embd, config.padded_vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
@@ -96,6 +75,14 @@ class PaddedLLaMA(nn.Module):
         self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
+
+        if T % 8 != 0:
+            # pad for fp8 support
+            pad = find_multiple(T, 8)
+            idx = torch.hstack((idx, torch.zeros(B, pad - T, device=idx.device, dtype=idx.dtype)))
+            if max_seq_length == T:
+                max_seq_length = pad
+            T = pad
 
         block_size = self.config.block_size
         if max_seq_length is None:
@@ -193,9 +180,9 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = TELinear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
-        self.c_proj = TELinear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -263,9 +250,9 @@ class MLP(nn.Module):
         n_hidden = int(2 * hidden_dim / 3)
         n_hidden = find_multiple(n_hidden, 256)
 
-        self.c_fc1 = TELinear(config.n_embd, n_hidden, bias=False)
-        self.c_fc2 = TELinear(config.n_embd, n_hidden, bias=False)
-        self.c_proj = TELinear(n_hidden, config.n_embd, bias=False)
+        self.c_fc1 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
@@ -329,6 +316,7 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
 
     # cast because the reference does
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+    print(x.shape, rope_cache.shape, xshaped.shape)
     rope_cache = rope_cache.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
